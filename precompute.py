@@ -1,5 +1,5 @@
 """
-Per-gene precomputation for the score test (pure NumPy/SciPy).
+Precomputation for the score test.
 
 Regresses each gene's counts onto the cell covariates and produces the score-test
 pieces (a, w, D) consumed by the kernel. Following Barry et al., the negative-binomial
@@ -7,6 +7,14 @@ GLM is fit quickly by (i) a Poisson GLM, (ii) estimating the NB size parameter t
 from the Poisson residuals, and (iii) taking the NB coefficients equal to the Poisson
 coefficients. This makes the pipeline self-contained: raw counts -> a,w,D -> kernel
 -> p-values.
+
+Two interchangeable implementations, selected by device:
+  * a per-gene NumPy/SciPy reference (`precompute_gene_batch`), and
+  * a batched PyTorch path (`precompute_gene_batch_torch`) that fits all genes at
+    once as tensor operations and runs on CPU or CUDA in float64.
+The dispersion (theta) fit dominates the cost, and it is dominated by digamma/trigamma
+evaluations; batching those across genes is what makes the GPU path fast. The two
+implementations agree to floating-point tolerance (see test_gpu_sceptre.py).
 
 The outputs (a, w, D) feed gpu_sceptre.run_association_test directly.
 """
@@ -124,8 +132,8 @@ def response_precomputation(y, X):
 
 
 def precompute_gene_batch(Y, X):
-    """Y (G,n) counts, X (n,d) covariates (incl. intercept). Returns A,W,D,MU,MU_hat.
-    A,W (G,n); D (G,d,n); MU (G,n) NB fitted mean; also returns raw Y as-is upstream."""
+    """Y (G,n) counts, X (n,d) covariates (incl. intercept). Returns A,W,D,MU.
+    A,W (G,n); D (G,d,n); MU (G,n) NB fitted mean. Per-gene NumPy reference."""
     G, n = Y.shape
     d = X.shape[1]
     A = np.empty((G, n)); W = np.empty((G, n)); D = np.empty((G, d, n)); MU = np.empty((G, n))
@@ -133,4 +141,115 @@ def precompute_gene_batch(Y, X):
         coefs, theta = response_precomputation(Y[g], X)
         a, w, Dg, mu = precompute_pieces(Y[g], X, coefs, theta)
         A[g], W[g], D[g], MU[g] = a, w, Dg, mu
+    return A, W, D, MU
+
+
+# ---- Batched PyTorch precompute (all genes at once; CPU or CUDA, float64) ----
+def _poisson_irls_batched(Y, X, max_iter=50, tol=1e-8):
+    """Poisson IRLS for a whole gene batch. Y (G,n), X (n,d) -> fitted mean (G,n).
+    Normal equations are formed and solved for all genes simultaneously."""
+    import torch
+    G, d = Y.shape[0], X.shape[1]
+    eta = torch.log(Y + 0.1)
+    beta = torch.zeros(G, d, dtype=Y.dtype, device=Y.device)
+    for _ in range(max_iter):
+        mu = torch.exp(eta).clamp_min(1e-10)
+        z = eta + (Y - mu) / mu                                # working response
+        XtWX = torch.einsum('ni,gn,nj->gij', X, mu, X)         # (G,d,d)
+        XtWz = torch.einsum('ni,gn->gi', X, mu * z)            # (G,d)
+        beta_new = torch.linalg.solve(XtWX, XtWz.unsqueeze(-1)).squeeze(-1)
+        eta = beta_new @ X.T
+        if (beta_new - beta).abs().max() < tol:
+            beta = beta_new
+            break
+        beta = beta_new
+    return torch.exp(eta)
+
+
+def _theta_batched(Y, mu, dfr, limit=50):
+    """NB size parameter theta for a whole gene batch (G,). Newton MLE with a
+    method-of-moments and pilot fallback, mirroring estimate_theta but vectorized
+    across genes: converged/diverged genes are frozen by a per-gene mask while the
+    remaining genes keep iterating. Returns theta (G,), clamped to [THETA_LO,THETA_HI]."""
+    import torch
+    G, n = Y.shape
+    eps = float(np.finfo(np.float64).eps ** 0.25)
+    digamma_t = torch.special.digamma
+    trigamma_t = lambda x: torch.special.polygamma(1, x)
+    t0 = n / ((Y / mu - 1.0) ** 2).sum(1)                      # pilot (G,)
+
+    def newton(step, init):
+        t = init.clone()
+        active = torch.ones(G, dtype=torch.bool, device=Y.device)
+        it_count = torch.zeros(G, device=Y.device)
+        for _ in range(limit):
+            if not active.any():
+                break
+            t = torch.minimum(t.abs(), t.new_tensor(1e8))
+            delta, bad = step(t)
+            new_t = t + delta
+            broke = bad | ~torch.isfinite(new_t)
+            t = torch.where(active & ~broke, new_t, t)
+            it_count += active.double()
+            active = active & ~broke & (delta.abs() > eps)
+        warn = (t < 0) | (it_count >= limit) | ~torch.isfinite(t)
+        return t, warn
+
+    def mle_step(t):
+        tc = t[:, None]
+        info = (trigamma_t(tc) - trigamma_t(tc + Y) - 1.0 / tc
+                + 2.0 / (mu + tc) - (Y + tc) / ((mu + tc) ** 2)).sum(1)
+        score = (digamma_t(tc + Y) - digamma_t(tc) + torch.log(tc) + 1.0
+                 - torch.log(tc + mu) - (Y + tc) / (mu + tc)).sum(1)
+        bad = (info == 0) | ~torch.isfinite(info)
+        return torch.where(bad, torch.zeros_like(score),
+                           score / torch.where(bad, torch.ones_like(info), info)), bad
+
+    def mm_step(t):
+        tc = t[:, None]
+        den = ((Y - mu) ** 2 / (mu + tc) ** 2).sum(1)
+        num = ((Y - mu) ** 2 / (mu + mu ** 2 / tc)).sum(1) - dfr
+        bad = (den == 0) | ~torch.isfinite(den)
+        return torch.where(bad, torch.zeros_like(num),
+                           -num / torch.where(bad, torch.ones_like(den), den)), bad
+
+    t_mle, warn_mle = newton(mle_step, t0)
+    est = t_mle.clone()
+    if warn_mle.any():
+        t_mm, warn_mm = newton(mm_step, t0)
+        est = torch.where(warn_mle & ~warn_mm, t_mm, est)      # MM where MLE warned
+        est = torch.where(warn_mle & warn_mm, t0, est)         # else pilot
+    return est.clamp(THETA_LO, THETA_HI)
+
+
+def precompute_gene_batch_torch(Y, X, device="cpu", dtype=None, gene_chunk=256):
+    """Batched equivalent of precompute_gene_batch, on `device` in `dtype` (default
+    float64). Y (G,n) counts, X (n,d) covariates. Returns torch tensors
+    A,W (G,n); D (G,d,n); MU (G,n) on `device`. Genes are processed in chunks of
+    `gene_chunk` to bound memory; results stay resident on the device."""
+    import torch
+    if dtype is None:
+        dtype = torch.float64
+    Xt = torch.as_tensor(X, dtype=dtype, device=device)
+    n, d = Xt.shape
+    G = Y.shape[0]
+    dfr = n - d
+    A = torch.empty(G, n, dtype=dtype, device=device)
+    W = torch.empty(G, n, dtype=dtype, device=device)
+    D = torch.empty(G, d, n, dtype=dtype, device=device)
+    MU = torch.empty(G, n, dtype=dtype, device=device)
+    for s in range(0, G, gene_chunk):
+        e = min(s + gene_chunk, G)
+        Yc = torch.as_tensor(Y[s:e], dtype=dtype, device=device)
+        mu = _poisson_irls_batched(Yc, Xt)
+        theta = _theta_batched(Yc, mu, dfr)
+        denom = 1.0 + mu / theta[:, None]
+        w = mu / denom
+        a = (Yc - mu) / denom
+        wZ = w.unsqueeze(-1) * Xt.unsqueeze(0)                 # (g,n,d)
+        ZtwZ = torch.einsum('gn,ni,nj->gij', w, Xt, Xt)        # (g,d,d)
+        vals, U = torch.linalg.eigh(ZtwZ)
+        Dc = torch.bmm((U / torch.sqrt(vals).unsqueeze(1)).transpose(-1, -2),
+                       wZ.transpose(-1, -2))                    # (g,d,n)
+        A[s:e], W[s:e], D[s:e], MU[s:e] = a, w, Dc, mu
     return A, W, D, MU

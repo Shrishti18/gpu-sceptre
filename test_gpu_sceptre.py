@@ -11,6 +11,7 @@ Run:  python3 test_gpu_sceptre.py
 import numpy as np
 import torch
 import gpu_sceptre as gs
+import precompute as pc
 
 torch.set_default_dtype(torch.float64)
 RNG = np.random.default_rng(7)
@@ -61,6 +62,17 @@ def make_data(G=14, n=3000, d=8, n_trt=60, B1=99, B2=299, B3=499, signal_genes=5
         a[g, trt] += RNG.uniform(3.0, 7.0)
     pool = gs.permutation_resamples(n, n_trt, B1 + B2 + B3, seed=11).numpy()
     return a, w, D, y, mu, trt, pool, (B1, B2, B3)
+
+
+def make_count_data(G=40, n=5000, d=3):
+    """NB counts + covariate matrix, for testing the precompute paths."""
+    X = np.column_stack([np.ones(n)] + [RNG.normal(0, 1, n) for _ in range(d - 1)])
+    coefs = np.column_stack([RNG.uniform(-1.0, 1.5, G)]
+                            + [RNG.normal(0, 0.3, G) for _ in range(d - 1)])
+    mu = np.exp(coefs @ X.T)
+    theta = RNG.uniform(5, 50, G)
+    Y = RNG.negative_binomial(theta[:, None], theta[:, None] / (theta[:, None] + mu)).astype(float)
+    return Y, X
 
 
 def main():
@@ -127,8 +139,22 @@ def main():
           f"unique-rows={rows_unique} in-range={in_range} uniform={unif}  "
           f"{'PASS' if samp_ok else 'FAIL'}")
 
+    # ---- 7. batched torch precompute == per-gene NumPy precompute -----------
+    Yc, Xc = make_count_data()
+    A_ref, W_ref, D_ref, MU_ref = pc.precompute_gene_batch(Yc, Xc)
+    At_, Wt_, Dt_, MUt_ = (x.cpu().numpy() for x in
+                           pc.precompute_gene_batch_torch(Yc, Xc, device=DEV, gene_chunk=16))
+    rel = lambda u, v: np.max(np.abs(u - v) / (np.abs(v) + 1e-12))
+    e_a, e_w, e_mu = rel(At_, A_ref), rel(Wt_, W_ref), rel(MUt_, MU_ref)
+    # D is defined up to eigvector sign/order; compare the invariant diag(D^T D)
+    e_D = rel((Dt_ ** 2).sum(1), (D_ref ** 2).sum(1))
+    pre_ok = e_a < 1e-7 and e_w < 1e-7 and e_mu < 1e-9 and e_D < 1e-6
+    print(f"[7] precompute: batched torch vs NumPy         : "
+          f"a {e_a:.1e} | w {e_w:.1e} | mu {e_mu:.1e} | diag(DᵀD) {e_D:.1e}  "
+          f"{'PASS' if pre_ok else 'FAIL'}")
+
     ok = (kerr < 1e-9 and oerr < 1e-9 and perr < 1e-12 and ferr < 1e-9
-          and zerr < 1e-9 and perr2 < 1e-12 and stage_ok and samp_ok)
+          and zerr < 1e-9 and perr2 < 1e-12 and stage_ok and samp_ok and pre_ok)
     print("\n" + ("ALL PASS - kernel reproduces the staged score test to machine precision."
                   if ok else "FAILURE — see above."))
     if out["_nonpos_var"]:

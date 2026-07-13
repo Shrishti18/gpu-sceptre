@@ -9,16 +9,17 @@ positives despite sparsity and technical confounding — is what the SCEPTRE met
 **conditionally-resampled** null treatment vectors. The cost is compute — at genome scale
 the test runs over millions of gRNA–gene pairs, each with hundreds to thousands of resamples.
 
-`gpu-sceptre` is an independent implementation in Python/PyTorch that expresses the per-pair
-hot loop as **batched linear algebra**, so it runs efficiently on CPU or CUDA in **float64**,
-matching a double-precision reference to machine precision. A whole batch of genes sharing a
-gRNA's resample set is evaluated in a single set of tensor operations.
+`gpu-sceptre` is an independent implementation in Python/PyTorch. Both halves of the cost —
+the per-gene negative-binomial GLM **precompute** and the per-pair resampling **kernel** — are
+expressed as **batched tensor operations across genes**, so the whole screen runs on one GPU
+(or CPU) in **float64**, matching a double-precision reference to machine precision.
 
 ## Method
 
 For each gene, a negative-binomial GLM is fit (Poisson fit + residual-based dispersion) to
-produce the score-test pieces `a, w, D`. For each gRNA, `B` without-replacement null treatment
-sets are drawn. The null score statistic for the whole gene batch is then
+produce the score-test pieces `a, w, D` — either per-gene in NumPy, or batched across all
+genes as tensor operations for GPU execution. For each gRNA, `B` without-replacement null
+treatment sets are drawn. The null score statistic for the whole gene batch is then
 
 ```
 z = (M · a) / sqrt(M · w  −  colSums((D · Mᵀ)²))
@@ -64,14 +65,30 @@ The demo prints and verifies three things on simulated data:
 - **Speed** — per-pair vs batched throughput on the selected device.
 
 On CPU it reports well-calibrated nulls (mean p ≈ 0.50, fraction below 0.05 ≈ 0.05) and a
-~3.5× speedup from batching alone; CUDA extends this at genome scale.
+few-fold speedup from batching alone. On a GPU both phases are accelerated (see Performance).
+
+## Performance
+
+Measured on a single NVIDIA T4 (free tier), simulated screen, float64:
+
+| phase | CPU | GPU (T4) | speedup |
+|---|---|---|---|
+| precompute — 2000 genes × 50k cells | ~590 s | ~24 s | ~24× |
+| resampling kernel — throughput | ~245 pairs/s | ~6,700 pairs/s | ~27× |
+
+The same code runs on either device — only the `device` string changes — and produces
+identical float64 results. On CUDA the batched precompute keeps `a, w, D` resident on the
+GPU, so nothing round-trips to the host between phases. End to end at that scale the screen
+goes from ~600 s (CPU-bound precompute) to under ~30 s. Numbers are workload-dependent;
+reproduce them with `demo.py`.
 
 ## Accuracy
 
 Computation is float64 end to end.
 
 - `python3 test_gpu_sceptre.py` checks the batched kernel against an independent NumPy
-  reference across the full three-stage screen (agreement to ~1e-15, exact stage assignment).
+  reference across the full three-stage screen (agreement to ~1e-15, exact stage assignment),
+  and checks the batched precompute against the per-gene NumPy reference.
 - `python3 reformulation_proof.py` verifies the batched matrix-multiply form equals the
   per-resample statistic to floating-point tolerance.
 
@@ -80,7 +97,7 @@ Computation is float64 end to end.
 | file | purpose |
 |---|---|
 | `gpu_sceptre.py` | batched score-test kernel, three-stage screen, p-values, sampler |
-| `precompute.py`  | per-gene negative-binomial GLM precomputation (`a, w, D`) |
+| `precompute.py`  | negative-binomial GLM precomputation (`a, w, D`) — per-gene NumPy + batched Torch |
 | `pipeline.py`    | `run_screen()` — end-to-end counts → results |
 | `demo.py`        | calibration, power, and speed on simulated data |
 | `test_gpu_sceptre.py` | correctness tests against an independent reference |

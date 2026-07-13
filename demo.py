@@ -108,8 +108,10 @@ def main():
         print(f"   per-pair (gene_chunk=1) : {t_base:7.2f}s  ({n_pairs/t_base:8.0f} pairs/s)")
     print(f"   batched  (gene_chunk=64): {t_test:7.2f}s  ({n_pairs/t_test:8.0f} pairs/s)"
           + (f"  -> {t_base/t_test:.1f}x from batching on {dev}" if not args.skip_baseline else f"  on {dev}"))
-    print(f"   precompute (once)       : {t_pre:7.2f}s")
-    print(f"\n   Re-run with --device cuda on a GPU to benchmark accelerated throughput.")
+    pre_path = "batched, on GPU" if dev == "cuda" else "per-gene, on CPU"
+    print(f"   precompute (once)       : {t_pre:7.2f}s  ({pre_path})")
+    if dev != "cuda":
+        print(f"\n   Re-run with --device cuda on a GPU for the accelerated precompute and kernel.")
 
 if __name__ == "__main__":
     main()
