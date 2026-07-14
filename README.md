@@ -73,13 +73,13 @@ Measured on a single NVIDIA T4 (free tier), simulated screen, float64:
 
 | phase | CPU | GPU (T4) | speedup |
 |---|---|---|---|
-| precompute — 2000 genes × 50k cells | ~590 s | ~24 s | ~24× |
-| resampling kernel — throughput | ~245 pairs/s | ~6,700 pairs/s | ~27× |
+| precompute — 2000 genes × 50k cells | ~595 s | ~20 s | ~30× |
+| resampling kernel — throughput | ~245 pairs/s | ~7,400 pairs/s | ~30× |
 
 The same code runs on either device — only the `device` string changes — and produces
 identical float64 results. On CUDA the batched precompute keeps `a, w, D` resident on the
 GPU, so nothing round-trips to the host between phases. End to end at that scale the screen
-goes from ~600 s (CPU-bound precompute) to under ~30 s. Numbers are workload-dependent;
+goes from ~600 s (CPU-bound precompute) to ~23 s — roughly 26×. Numbers are workload-dependent;
 reproduce them with `demo.py`.
 
 ## Accuracy
