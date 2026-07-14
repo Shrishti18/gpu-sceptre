@@ -108,6 +108,46 @@ extrapolation, not a run. The dense float64 count matrix at that size is ~32 GB,
 support (not yet implemented). For context, the SCEPTRE paper reports ~1 day on ~500 CPU
 cores for a job of that scale.
 
+## Benchmark vs SCEPTRE
+
+A head-to-head against the reference SCEPTRE R package on **SCEPTRE's own example
+dataset** (`sceptredata::highmoi_example_data`, 526 genes × 45,919 cells), matched
+workload (1,000 calibration pairs; both timings include per-gene precompute). Measured
+on free Colab hardware — one T4 GPU vs the Colab CPU:
+
+| tool | hardware | time (1,000 pairs) | vs gpu-sceptre |
+|---|---|---|---|
+| **gpu-sceptre** | 1 × T4 GPU | **~4.9 s** | 1× |
+| SCEPTRE (R) | 1 CPU core  | ~142 s | **~29× slower** |
+| SCEPTRE (R) | 2 CPU cores | ~113 s | **~23× slower** |
+
+SCEPTRE sped up only ~1.25× from 1→2 cores here (**~63% parallel efficiency**), so
+matching one T4 on this workload takes **on the order of 30+ CPU cores**. Both tools
+compute the same statistics (gpu-sceptre is validated to machine precision against an
+independent reference — see Accuracy).
+
+*Caveats, stated plainly:* SCEPTRE runs on its real example data; gpu-sceptre runs a
+matched-size, matched-count **simulated** workload (timing depends on dimensions, not
+values). The pair *sets* differ (SCEPTRE's negative-control pairs vs simulated pairs) —
+this is a timing comparison at matched scale, not an identical-pairs benchmark.
+
+**Reproduce** (needs the `sceptre` + `sceptredata` R packages; setup below is for
+Colab / Ubuntu 22.04):
+
+```bash
+# 1. R + fast binary deps (r2u) + SCEPTRE from GitHub (not on CRAN)
+echo "deb [arch=amd64] https://r2u.stat.illinois.edu/ubuntu jammy main" > /etc/apt/sources.list.d/cranapt.list
+wget -qO- https://eddelbuettel.github.io/r2u/assets/dirk_eddelbuettel_key.asc \
+  | tee /etc/apt/trusted.gpg.d/cranapt_key.asc >/dev/null
+apt-get update -qq && apt-get install -y r-base-core r-cran-remotes r-cran-rcpp r-cran-bh \
+  r-cran-matrix r-cran-data.table r-cran-dplyr r-cran-ggplot2 r-cran-cowplot r-cran-crayon r-cran-scales
+Rscript -e 'remotes::install_github(c("Katsevich-Lab/sceptre","Katsevich-Lab/sceptredata"), upgrade="never")'
+
+# 2. run both sides
+Rscript benchmark_vs_sceptre.R      # SCEPTRE -> sceptre_timing.txt
+python3 benchmark_vs_sceptre.py     # gpu-sceptre matched workload + comparison
+```
+
 ## Accuracy
 
 Computation is float64 end to end.
@@ -127,6 +167,8 @@ Computation is float64 end to end.
 | `pipeline.py`    | `run_screen()` — end-to-end counts → results |
 | `demo.py`        | calibration, power, and speed on simulated data |
 | `benchmark.py`   | reproducible scaling sweep + genome-scale extrapolation |
+| `benchmark_vs_sceptre.R` | time the reference SCEPTRE R package on its example data |
+| `benchmark_vs_sceptre.py` | run gpu-sceptre on the matched workload and compare |
 | `test_gpu_sceptre.py` | correctness tests against an independent reference |
 | `reformulation_proof.py` | matrix-multiply-equivalence check |
 
