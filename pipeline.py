@@ -64,6 +64,6 @@ def run_screen(Y, X, grna_to_cells, device="cpu",
 def pick_device():
     """Accuracy-first device selection: f64-capable devices only (CUDA, else CPU).
     MPS is intentionally excluded from auto-selection because it has no float64;
-    the validated pipeline is f64. Request MPS explicitly (experimental, f32) if
-    you want to benchmark the Apple GPU, but it is not part of the accuracy claim."""
+    the validated pipeline is f64. MPS can be requested explicitly (f32 only), but that
+    path is untested (no Apple hardware here) and is not part of the accuracy claim."""
     return "cuda" if torch.cuda.is_available() else "cpu"

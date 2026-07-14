@@ -106,8 +106,9 @@ Computation is float64 end to end.
 ## Devices and precision
 
 - **CPU** and **CUDA** run in float64 — the validated path.
-- The Apple **MPS** backend has no float64; MPS is supported only in float32 as an
-  experimental speed option and is not used for reference-accuracy results.
+- The Apple **MPS** backend has no float64. The code accepts an MPS device in float32
+  (and blocks mps+float64), but that path is **untested** — there is no Apple hardware
+  in the loop — and is not part of the validated results. Use CPU or CUDA for accuracy.
 
 ## Citation
 
